@@ -12,12 +12,14 @@ function isValidDate(value) {
 
   const date = new Date(`${value}T00:00:00.000Z`);
 
-  return !Number.isNaN(date.getTime()) &&
-    date.toISOString().slice(0, 10) === value;
+  return (
+    !Number.isNaN(date.getTime()) &&
+    date.toISOString().slice(0, 10) === value
+  );
 }
 
 router.post("/", async (req, res) => {
-  const { roomId, guestName, guestEmail, checkIn, checkOut } = req.body;
+  const { roomId, guestName, guestEmail, checkIn, checkOut } = req.body ?? {};
 
   if (
     !Number.isInteger(roomId) ||
@@ -37,15 +39,39 @@ router.post("/", async (req, res) => {
     });
   }
 
-  const bookingReference = `RSV-${randomUUID().replaceAll("-", "").slice(0, 12).toUpperCase()}`;
+  const bookingReference = `RSV-${randomUUID()
+    .replaceAll("-", "")
+    .slice(0, 12)
+    .toUpperCase()}`;
+
+  let client;
 
   try {
-    const result = await pool.query(
+    client = await pool.connect();
+
+    await client.query("BEGIN");
+
+    // Serialize reservation creation for the same room.
+    const roomResult = await client.query(
+      `SELECT id
+       FROM rooms
+       WHERE id = $1 AND is_active = TRUE
+       FOR UPDATE`,
+      [roomId]
+    );
+
+    if (roomResult.rowCount === 0) {
+      await client.query("ROLLBACK");
+
+      return res.status(404).json({
+        error: "Room not found or inactive.",
+      });
+    }
+
+    const result = await client.query(
       `INSERT INTO reservations
         (booking_reference, room_id, guest_name, guest_email, check_in, check_out)
-       SELECT $1, id, $3, $4, $5, $6
-       FROM rooms
-       WHERE id = $2 AND is_active = TRUE
+       VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING id, booking_reference, room_id, guest_name,
                  guest_email, check_in, check_out, status, created_at`,
       [
@@ -58,17 +84,21 @@ router.post("/", async (req, res) => {
       ]
     );
 
-    if (result.rowCount === 0) {
-      return res.status(404).json({
-        error: "Room not found or inactive.",
-      });
-    }
+    await client.query("COMMIT");
 
     return res.status(201).json({
       message: "Reservation created successfully.",
       reservation: result.rows[0],
     });
   } catch (error) {
+    if (client) {
+      try {
+        await client.query("ROLLBACK");
+      } catch (rollbackError) {
+        console.error("Reservation rollback error:", rollbackError.message);
+      }
+    }
+
     if (error.code === "23P01") {
       return res.status(409).json({
         error: "This room is already booked for the selected dates.",
@@ -80,6 +110,8 @@ router.post("/", async (req, res) => {
     return res.status(500).json({
       error: "Unable to create reservation.",
     });
+  } finally {
+    client?.release();
   }
 });
 
